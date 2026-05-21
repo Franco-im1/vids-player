@@ -288,7 +288,7 @@ pub fn run() {
             // macOS: el OS envía RunEvent::Opened en vez de args CLI
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = _event {
-                use tauri::Emitter;
+                use tauri::{Emitter, Manager};
                 let paths: Vec<String> = urls
                     .iter()
                     .filter_map(|u| u.to_file_path().ok())
