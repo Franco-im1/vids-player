@@ -56,10 +56,6 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
 
-    env:
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-
     steps:
       - uses: actions/checkout@v4
 
@@ -95,10 +91,24 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      - name: Setup signing key
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "✓ Signing key is set (${#KEY} chars)"
+            echo "$KEY" > /tmp/signing.key
+            echo "Key written to /tmp/signing.key"
+          else
+            echo "✗ Signing key is NOT set — latest.json will not be generated"
+          fi
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+
       - name: Build and upload artifacts
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY_PATH: /tmp/signing.key
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}
