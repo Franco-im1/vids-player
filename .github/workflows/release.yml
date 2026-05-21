@@ -12,31 +12,36 @@ jobs:
   create-release:
     runs-on: ubuntu-latest
     outputs:
-      release_id: ${{ steps.create-release.outputs.releaseId }}
+      release_id: ${{ steps.create.outputs.release_id }}
     steps:
-      - uses: actions/checkout@v4
       - name: Create draft release
-        id: create-release
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        id: create
+        uses: actions/github-script@v7
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Player ${{ github.ref_name }}'
-          releaseBody: |
-            ## Instalación
-
-            ### Linux
-            - **`.deb`** (Ubuntu/Debian): `sudo apt install ./videoplayer_*.deb`
-            - **`.AppImage`**: dale permiso de ejecución y ábrelo directamente
-              ```bash
-              chmod +x videoplayer_*.AppImage && ./videoplayer_*.AppImage
-              ```
-
-            ### macOS
-            - **`.dmg`**: ábrelo y arrastra el ícono a la carpeta Aplicaciones
-          releaseDraft: true
-          prerelease: false
+          script: |
+            const tag = context.ref.replace('refs/tags/', '');
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `Player ${tag}`,
+              body: [
+                '## Instalación',
+                '',
+                '### Linux',
+                '- **`.deb`** (Ubuntu/Debian): `sudo apt install ./videoplayer_*.deb`',
+                '- **`.AppImage`**: dale permiso de ejecución y ábrelo directamente',
+                '  ```bash',
+                '  chmod +x videoplayer_*.AppImage && ./videoplayer_*.AppImage',
+                '  ```',
+                '',
+                '### macOS',
+                '- **`.dmg`**: ábrelo y arrastra el ícono a la carpeta Aplicaciones',
+              ].join('\n'),
+              draft: true,
+              prerelease: false,
+            });
+            core.setOutput('release_id', data.id);
 
   build:
     needs: create-release
@@ -102,13 +107,11 @@ jobs:
     steps:
       - name: Publish release
         uses: actions/github-script@v7
-        env:
-          release_id: ${{ needs.create-release.outputs.release_id }}
         with:
           script: |
             github.rest.repos.updateRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              release_id: process.env.release_id,
+              release_id: ${{ needs.create-release.outputs.release_id }},
               draft: false,
             })
