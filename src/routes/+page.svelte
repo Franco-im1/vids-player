@@ -24,6 +24,9 @@
   let panY = $state(0);
   let isPanning = $state(false);
   let rotation = $state(0); // 0, 90, 180, 270
+  let updating = $state(false);
+  let updateDownloaded = $state(0);
+  let updateTotal = $state(0);
 
   let hideTimer: ReturnType<typeof setTimeout> | undefined;
   let unlistenDrop: (() => void) | null = null;
@@ -253,7 +256,19 @@
         { title: "Actualización disponible" }
       );
       if (!yes) return;
-      await update.downloadAndInstall();
+      updating = true;
+      updateDownloaded = 0;
+      updateTotal = 0;
+      await update.downloadAndInstall((event) => {
+        switch (event.event) {
+          case 'Started':
+            updateTotal = event.data.contentLength ?? 0;
+            break;
+          case 'Progress':
+            updateDownloaded += event.data.chunkLength;
+            break;
+        }
+      });
       await relaunch();
     } catch (_) {
       // Sin conexión o sin endpoint configurado — ignorar silenciosamente
@@ -432,6 +447,22 @@
       </div>
     </div>
   </div>
+
+  {#if updating}
+    <div class="update-overlay">
+      <p class="update-label">Descargando actualización…</p>
+      <div class="update-bar-wrap">
+        {#if updateTotal > 0}
+          <div class="update-bar-fill" style="width: {Math.round((updateDownloaded / updateTotal) * 100)}%"></div>
+        {:else}
+          <div class="update-bar-indeterminate"></div>
+        {/if}
+      </div>
+      {#if updateTotal > 0}
+        <p class="update-pct">{Math.round((updateDownloaded / updateTotal) * 100)}%</p>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -660,5 +691,58 @@
     background: #fff;
     cursor: pointer;
     border: none;
+  }
+
+  /* ── Update overlay ──────────────────────────── */
+  .update-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.88);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    z-index: 100;
+  }
+
+  .update-label {
+    font-family: system-ui, sans-serif;
+    font-size: 14px;
+    color: rgba(255, 255, 255, 0.85);
+  }
+
+  .update-pct {
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.45);
+  }
+
+  .update-bar-wrap {
+    width: 220px;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .update-bar-fill {
+    height: 100%;
+    background: #fff;
+    border-radius: 2px;
+    transition: width 0.2s ease;
+  }
+
+  @keyframes indeterminate {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(420%); }
+  }
+
+  .update-bar-indeterminate {
+    height: 100%;
+    width: 25%;
+    background: #fff;
+    border-radius: 2px;
+    animation: indeterminate 1.3s ease-in-out infinite;
   }
 </style>
