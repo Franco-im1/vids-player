@@ -1,5 +1,6 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Mutex;
 
 // ── MIME ─────────────────────────────────────────────────────────────────────
 
@@ -17,7 +18,6 @@ fn mime_for_path(path: &std::path::Path) -> &'static str {
         Some("mov") | Some("qt") => "video/quicktime",
         Some("flv") => "video/x-flv",
         Some("wmv") => "video/x-ms-wmv",
-        Some("gif") => "image/gif",
         _ => "application/octet-stream",
     }
 }
@@ -49,31 +49,34 @@ fn parse_range(range_str: &str, file_size: u64) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
-// ── File reading ──────────────────────────────────────────────────────────────
-
-fn read_bytes(path: &std::path::Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
-    let mut file = std::fs::File::open(path)?;
-    file.seek(SeekFrom::Start(start))?;
-    let length = (end - start + 1) as usize;
-    let mut buf = vec![0u8; length];
-    let mut offset = 0;
-    while offset < length {
-        match file.read(&mut buf[offset..]) {
-            Ok(0) => break,
-            Ok(n) => offset += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    buf.truncate(offset);
-    Ok(buf)
-}
-
 // ── HTTP video server ─────────────────────────────────────────────────────────
 
-fn send_raw(stream: &mut TcpStream, head: String, body: &[u8]) {
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body);
+const CHUNK: usize = 512 * 1024; // 512 KB
+
+fn stream_body(stream: &mut TcpStream, path: &std::path::Path, start: u64, end: u64) {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return;
+    }
+    let mut remaining = end - start + 1;
+    let mut buf = vec![0u8; CHUNK];
+    while remaining > 0 {
+        let to_read = (remaining as usize).min(CHUNK);
+        match file.read(&mut buf[..to_read]) {
+            Ok(0) => break,
+            Ok(n) => {
+                if stream.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                remaining -= n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
     let _ = stream.flush();
 }
 
@@ -176,30 +179,23 @@ fn handle_http(mut stream: TcpStream) {
         (0, file_size - 1)
     };
 
-    match read_bytes(path, start, end) {
-        Ok(data) => {
-            let is_range = range_header.is_some();
-            let status = if is_range { "206 Partial Content" } else { "200 OK" };
-            let mut head = format!(
-                "HTTP/1.1 {status}\r\n\
-                Content-Type: {mime}\r\n\
-                Content-Length: {}\r\n\
-                Accept-Ranges: bytes\r\n\
-                Access-Control-Allow-Origin: *\r\n\
-                Access-Control-Expose-Headers: Content-Length, Content-Range\r\n",
-                data.len()
-            );
-            if is_range {
-                head.push_str(&format!("Content-Range: bytes {start}-{end}/{file_size}\r\n"));
-            }
-            head.push_str("\r\n");
-            send_raw(&mut stream, head, &data);
-        }
-        Err(_) => {
-            let _ = stream.write_all(
-                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
-            );
-        }
+    let is_range = range_header.is_some();
+    let content_length = end - start + 1;
+    let status = if is_range { "206 Partial Content" } else { "200 OK" };
+    let mut head = format!(
+        "HTTP/1.1 {status}\r\n\
+        Content-Type: {mime}\r\n\
+        Content-Length: {content_length}\r\n\
+        Accept-Ranges: bytes\r\n\
+        Access-Control-Allow-Origin: *\r\n\
+        Access-Control-Expose-Headers: Content-Length, Content-Range\r\n"
+    );
+    if is_range {
+        head.push_str(&format!("Content-Range: bytes {start}-{end}/{file_size}\r\n"));
+    }
+    head.push_str("\r\n");
+    if stream.write_all(head.as_bytes()).is_ok() {
+        stream_body(&mut stream, path, start, end);
     }
 }
 
@@ -219,6 +215,7 @@ fn start_video_server() -> u16 {
 // ── Tauri managed state ───────────────────────────────────────────────────────
 
 struct VideoServerPort(u16);
+struct InitialFile(Mutex<Option<String>>);
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
@@ -228,21 +225,32 @@ fn get_server_port(state: tauri::State<VideoServerPort>) -> u16 {
 }
 
 #[tauri::command]
-async fn pick_video(app: tauri::AppHandle) -> Result<String, String> {
+fn get_initial_file(state: tauri::State<InitialFile>) -> Option<String> {
+    state.0.lock().unwrap().take()
+}
+
+#[tauri::command]
+async fn pick_video(app: tauri::AppHandle, start_dir: Option<String>) -> Result<String, String> {
     use tauri_plugin_dialog::DialogExt;
     use std::sync::mpsc;
 
     let (tx, rx) = mpsc::channel();
 
-    app.dialog()
+    let mut dialog = app
+        .dialog()
         .file()
-        .add_filter(
-            "Video / GIF",
-            &["mp4", "m4v", "mkv", "avi", "mov", "webm", "flv", "wmv", "gif"],
-        )
-        .pick_file(move |result| {
-            let _ = tx.send(result);
-        });
+        .add_filter("Video", &["mp4", "m4v", "mkv", "avi", "mov", "webm", "flv", "wmv"]);
+
+    if let Some(dir) = start_dir {
+        let p = std::path::PathBuf::from(&dir);
+        if p.is_dir() {
+            dialog = dialog.set_directory(p);
+        }
+    }
+
+    dialog.pick_file(move |result| {
+        let _ = tx.send(result);
+    });
 
     tauri::async_runtime::spawn_blocking(move || rx.recv().ok().flatten())
         .await
@@ -257,13 +265,42 @@ async fn pick_video(app: tauri::AppHandle) -> Result<String, String> {
 pub fn run() {
     let port = start_video_server();
 
+    // Linux: la app recibe el archivo como argumento CLI al hacer doble clic
+    #[cfg(target_os = "linux")]
+    let initial_file = std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with('-') && std::path::Path::new(a).exists());
+
+    #[cfg(not(target_os = "linux"))]
+    let initial_file: Option<String> = None;
+
     tauri::Builder::default()
         .manage(VideoServerPort(port))
+        .manage(InitialFile(Mutex::new(initial_file)))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .invoke_handler(tauri::generate_handler![pick_video, get_server_port])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .invoke_handler(tauri::generate_handler![pick_video, get_server_port, get_initial_file])
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app, _event| {
+            // macOS: el OS envía RunEvent::Opened en vez de args CLI
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = _event {
+                use tauri::Emitter;
+                let paths: Vec<String> = urls
+                    .iter()
+                    .filter_map(|u| u.to_file_path().ok())
+                    .filter_map(|p| p.to_str().map(String::from))
+                    .collect();
+
+                // Cold start: guardar para que el frontend lo lea al montar
+                if let Some(first) = paths.first() {
+                    *_app.state::<InitialFile>().0.lock().unwrap() = Some(first.clone());
+                }
+                // Warm start: app ya abierta, notificar directamente
+                let _ = _app.emit("opened", paths);
+            }
+        });
 }

@@ -1,56 +1,40 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { onMount, onDestroy, tick } from "svelte";
-  import type { ParsedFrame } from "gifuct-js";
   import { check } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
   import { ask } from "@tauri-apps/plugin-dialog";
 
   let videoEl = $state<HTMLVideoElement | null>(null);
   let containerEl = $state<HTMLDivElement | null>(null);
-  let gifCanvas = $state<HTMLCanvasElement | null>(null);
 
   let serverPort = 0;
   let videoSrc = $state<string | null>(null);
-  let isGif = $state(false);
   let paused = $state(true);
   let currentTime = $state(0);
   let duration = $state(0);
   let volume = $state(1);
   let muted = $state(false);
   let showControls = $state(false);
-  let looping = $state(false);
+  let looping = $state(localStorage.getItem("looping") === "true");
   let zoomLevel = $state(1);
   let panX = $state(0);
   let panY = $state(0);
   let isPanning = $state(false);
+  let rotation = $state(0); // 0, 90, 180, 270
 
   let hideTimer: ReturnType<typeof setTimeout> | undefined;
   let unlistenDrop: (() => void) | null = null;
+  let unlistenOpened: (() => void) | null = null;
   let panOriginX = 0, panOriginY = 0;
   let panOriginOffX = 0, panOriginOffY = 0;
   let didPan = false;
 
-  let gifDisplayWidth = $state(0);
-  let gifDisplayHeight = $state(0);
-  let gifSpeed = $state(1);
-
-  // GIF playback state (non-reactive for perf)
-  let gifFrames: ParsedFrame[] = [];
-  let gifFrameIndex = 0;
-  let gifTimer: ReturnType<typeof setTimeout> | undefined;
-  let gifCtx: CanvasRenderingContext2D | null = null;
-  let gifTmpCanvas: HTMLCanvasElement | null = null;
-  let gifTmpCtx: CanvasRenderingContext2D | null = null;
-  let gifWidth = 0;
-  let gifHeight = 0;
-  let gifFrameTimes: number[] = [];
-  let gifPrevDisposal = 0;
-  let gifSavedImageData: ImageData | null = null;
-
   $effect(() => {
     if (videoEl) videoEl.loop = looping;
+    localStorage.setItem("looping", String(looping));
   });
 
   function fmt(s: number | undefined) {
@@ -78,194 +62,26 @@
     showControls = false;
   }
 
-  // ── GIF playback ──────────────────────────────────────────────────────────────
-
-  function stopGif() {
-    clearTimeout(gifTimer);
-    gifTimer = undefined;
-    gifFrames = [];
-    gifFrameIndex = 0;
-    gifFrameTimes = [];
-    gifCtx = null;
-    gifTmpCanvas = null;
-    gifTmpCtx = null;
-    gifWidth = 0;
-    gifHeight = 0;
-    gifPrevDisposal = 0;
-    gifSavedImageData = null;
-  }
-
-  function renderGifFrame(index: number) {
-    if (!gifCtx || !gifTmpCtx || !gifTmpCanvas || !gifFrames.length) return;
-    const frame = gifFrames[index];
-
-    // Dispose previous frame
-    if (gifPrevDisposal === 2) {
-      gifCtx.clearRect(0, 0, gifWidth, gifHeight);
-    } else if (gifPrevDisposal === 3 && gifSavedImageData) {
-      gifCtx.putImageData(gifSavedImageData, 0, 0);
-      gifSavedImageData = null;
-    }
-
-    if (frame.disposalType === 3) {
-      gifSavedImageData = gifCtx.getImageData(0, 0, gifWidth, gifHeight);
-    }
-
-    // Draw via tmp canvas so alpha compositing respects transparency
-    gifTmpCtx.clearRect(0, 0, frame.dims.width, frame.dims.height);
-    gifTmpCtx.putImageData(
-      new ImageData(frame.patch, frame.dims.width, frame.dims.height),
-      0, 0
-    );
-    gifCtx.drawImage(
-      gifTmpCanvas,
-      0, 0, frame.dims.width, frame.dims.height,
-      frame.dims.left, frame.dims.top, frame.dims.width, frame.dims.height
-    );
-
-    gifPrevDisposal = frame.disposalType;
-  }
-
-  // Seek to a specific frame with correct disposal state.
-  // If advancing forward by one frame we can skip the full re-render from 0.
-  function seekToFrame(targetIdx: number) {
-    if (!gifCtx || !gifFrames.length) return;
-    const canIncrement = targetIdx === gifFrameIndex + 1 && targetIdx < gifFrames.length;
-    if (canIncrement) {
-      // Just render the next frame directly; disposal state is already correct
-      gifFrameIndex = targetIdx;
-      renderGifFrame(targetIdx);
-    } else {
-      // Full re-render from 0 to guarantee correct disposal chain
-      gifCtx.clearRect(0, 0, gifWidth, gifHeight);
-      gifPrevDisposal = 0;
-      gifSavedImageData = null;
-      for (let i = 0; i <= targetIdx; i++) renderGifFrame(i);
-      gifFrameIndex = targetIdx;
-    }
-    currentTime = gifFrameTimes[targetIdx] / 1000;
-  }
-
-  function gifPlayLoop() {
-    if (paused || !gifFrames.length || !gifCtx) return;
-    renderGifFrame(gifFrameIndex);
-
-    const frame = gifFrames[gifFrameIndex];
-    // Mínimo 10ms (igual que los navegadores); dividir por speed para acelerar/ralentizar
-    const delay = Math.max(10, (frame.delay || 10) * 10) / gifSpeed;
-
-    gifTimer = setTimeout(() => {
-      if (paused) return;
-      const next = (gifFrameIndex + 1) % gifFrames.length;
-      if (next === 0 && !looping) {
-        paused = true;
-        currentTime = duration;
-        return;
-      }
-      gifFrameIndex = next;
-      currentTime = gifFrameTimes[gifFrameIndex] / 1000;
-      gifPlayLoop();
-    }, delay);
-  }
-
-  function cycleGifSpeed() {
-    const speeds = [0.5, 1, 2, 4];
-    gifSpeed = speeds[(speeds.indexOf(gifSpeed) + 1) % speeds.length];
-    // Reiniciar el timer con la nueva velocidad de inmediato
-    if (!paused) {
-      clearTimeout(gifTimer);
-      gifTimer = undefined;
-      gifPlayLoop();
-    }
-  }
-
-  async function loadGif(url: string) {
-    stopGif();
-    paused = true;
-    currentTime = 0;
-    duration = 0;
-    gifFrameIndex = 0;
-
-    try {
-      const resp = await fetch(url);
-      const buffer = await resp.arrayBuffer();
-      const { parseGIF, decompressFrames } = await import("gifuct-js");
-      const gif = parseGIF(buffer);
-      gifFrames = decompressFrames(gif, true);
-
-      if (!gifFrames.length) return;
-
-      gifWidth = gif.lsd.width;
-      gifHeight = gif.lsd.height;
-
-      // Build per-frame cumulative start times
-      gifFrameTimes = [];
-      let t = 0;
-      for (const frame of gifFrames) {
-        gifFrameTimes.push(t);
-        t += Math.max(20, (frame.delay || 10) * 10);
-      }
-      duration = t / 1000;
-
-      // Compute CSS display size (fill viewport, maintain aspect ratio)
-      if (containerEl) {
-        const r = containerEl.getBoundingClientRect();
-        const scale = Math.min(r.width / gifWidth, r.height / gifHeight);
-        gifDisplayWidth = Math.round(gifWidth * scale);
-        gifDisplayHeight = Math.round(gifHeight * scale);
-      }
-
-      // Reusable offscreen canvas for frame compositing
-      const maxW = Math.max(...gifFrames.map(f => f.dims.width));
-      const maxH = Math.max(...gifFrames.map(f => f.dims.height));
-      gifTmpCanvas = document.createElement("canvas");
-      gifTmpCanvas.width = maxW;
-      gifTmpCanvas.height = maxH;
-      gifTmpCtx = gifTmpCanvas.getContext("2d");
-
-      await tick();
-
-      if (gifCanvas) {
-        gifCtx = gifCanvas.getContext("2d");
-        gifCanvas.width = gifWidth;
-        gifCanvas.height = gifHeight;
-        gifPrevDisposal = 0;
-        gifSavedImageData = null;
-        paused = false;
-        gifPlayLoop();
-      }
-    } catch (e) {
-      console.error("GIF load error:", e);
-    }
-  }
-
   // ── File loading ──────────────────────────────────────────────────────────────
 
   async function loadPath(path: string) {
     resetZoom();
-    gifSpeed = 1;
+    rotation = 0;
+    const dir = path.substring(0, path.lastIndexOf("/"));
+    if (dir) localStorage.setItem("lastDir", dir);
     const url = `http://127.0.0.1:${serverPort}/video?path=${encodeURIComponent(path)}`;
-    const gif = path.toLowerCase().endsWith(".gif");
-
-    if (!gif) {
-      stopGif();
-      isGif = false;
-      videoSrc = url;
-      await tick();
-      if (videoEl) {
-        videoEl.load();
-        videoEl.play().catch(() => {});
-      }
-    } else {
-      isGif = true;
-      videoSrc = url; // truthy → hides drop zone, shows controls
-      await loadGif(url);
+    videoSrc = url;
+    await tick();
+    if (videoEl) {
+      videoEl.load();
+      videoEl.play().catch(() => {});
     }
   }
 
   async function openFile() {
     try {
-      const path = await invoke<string>("pick_video");
+      const startDir = localStorage.getItem("lastDir") ?? undefined;
+      const path = await invoke<string>("pick_video", { startDir });
       await loadPath(path);
     } catch (_) {}
   }
@@ -275,6 +91,9 @@
   function resetZoom() {
     zoomLevel = 1; panX = 0; panY = 0;
   }
+
+  function rotateLeft()  { rotation = (rotation + 270) % 360; panX = 0; panY = 0; }
+  function rotateRight() { rotation = (rotation +  90) % 360; panX = 0; panY = 0; }
 
   function applyZoom(factor: number) {
     zoomLevel = Math.max(1, Math.min(8, zoomLevel * factor));
@@ -332,21 +151,6 @@
   // ── Playback control ──────────────────────────────────────────────────────────
 
   function togglePlay() {
-    if (isGif) {
-      if (paused) {
-        // Si llegó al final en modo no-bucle, reiniciar desde el principio
-        if (!looping && currentTime >= duration && gifFrames.length > 0) {
-          seekToFrame(0);
-        }
-        paused = false;
-        gifPlayLoop();
-      } else {
-        paused = true;
-        clearTimeout(gifTimer);
-        gifTimer = undefined;
-      }
-      return;
-    }
     if (!videoEl) return;
     if (videoEl.paused) videoEl.play().catch(() => {});
     else videoEl.pause();
@@ -358,25 +162,9 @@
   }
 
   function onProgressClick(e: MouseEvent) {
-    if (!videoSrc) return;
+    if (!videoEl || !duration) return;
     const rect = (e.currentTarget as Element).getBoundingClientRect();
     const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-
-    if (isGif) {
-      if (!gifFrames.length) return;
-      const targetMs = pct * duration * 1000;
-      let idx = 0;
-      for (let i = gifFrameTimes.length - 1; i >= 0; i--) {
-        if (gifFrameTimes[i] <= targetMs) { idx = i; break; }
-      }
-      if (gifTimer !== undefined) cancelAnimationFrame(gifTimer);
-      gifTimer = undefined;
-      seekToFrame(idx);
-      if (!paused) gifPlayLoop();
-      return;
-    }
-
-    if (!videoEl || !duration) return;
     videoEl.currentTime = pct * duration;
   }
 
@@ -401,30 +189,22 @@
     switch (e.code) {
       case "ArrowRight":
         e.preventDefault();
-        if (isGif && gifFrames.length) {
-          seekToFrame(Math.min(gifFrames.length - 1, gifFrameIndex + 1));
-        } else if (videoEl) {
-          videoEl.currentTime = Math.min(duration, currentTime + 5);
-        }
+        if (videoEl) videoEl.currentTime = Math.min(duration, currentTime + 5);
         break;
       case "ArrowLeft":
         e.preventDefault();
-        if (isGif && gifFrames.length) {
-          seekToFrame(Math.max(0, gifFrameIndex - 1));
-        } else if (videoEl) {
-          videoEl.currentTime = Math.max(0, currentTime - 5);
-        }
+        if (videoEl) videoEl.currentTime = Math.max(0, currentTime - 5);
         break;
       case "ArrowUp":
         e.preventDefault();
-        if (!isGif && videoEl) videoEl.volume = Math.min(1, volume + 0.05);
+        if (videoEl) videoEl.volume = Math.min(1, volume + 0.05);
         break;
       case "ArrowDown":
         e.preventDefault();
-        if (!isGif && videoEl) videoEl.volume = Math.max(0, volume - 0.05);
+        if (videoEl) videoEl.volume = Math.max(0, volume - 0.05);
         break;
       case "KeyM":
-        if (!isGif && videoEl) videoEl.muted = !videoEl.muted;
+        if (videoEl) videoEl.muted = !videoEl.muted;
         break;
       case "KeyF":
         toggleFullscreen();
@@ -451,6 +231,14 @@
         e.preventDefault();
         resetZoom();
         break;
+      case "BracketLeft":
+        e.preventDefault();
+        rotateLeft();
+        break;
+      case "BracketRight":
+        e.preventDefault();
+        rotateRight();
+        break;
     }
   }
 
@@ -474,7 +262,15 @@
 
   onMount(async () => {
     serverPort = await invoke("get_server_port");
-    // Verificar actualizaciones en segundo plano después del arranque
+
+    const initialFile = await invoke<string | null>("get_initial_file");
+    if (initialFile) await loadPath(initialFile);
+
+    // macOS warm start: app ya abierta cuando el usuario abre otro archivo
+    unlistenOpened = await listen<string[]>("opened", (e) => {
+      if (e.payload[0]) loadPath(e.payload[0]);
+    });
+
     setTimeout(checkForUpdates, 4000);
     window.addEventListener("keydown", onKeyDown);
     containerEl!.addEventListener("wheel", onWheel, { passive: false });
@@ -493,8 +289,8 @@
     window.removeEventListener("keydown", onKeyDown);
     containerEl?.removeEventListener("wheel", onWheel);
     clearTimeout(hideTimer);
-    stopGif();
     unlistenDrop?.();
+    unlistenOpened?.();
   });
 </script>
 
@@ -512,18 +308,8 @@
     <button class="drop-zone" onclick={openFile}>
       <span class="play-icon">▶</span>
       <p class="label">Arrastra un video o haz clic para abrir</p>
-      <p class="formats">mp4 · mkv · avi · mov · webm · flv · gif</p>
+      <p class="formats">mp4 · mkv · avi · mov · webm · flv</p>
     </button>
-  {:else if isGif}
-    <canvas
-      bind:this={gifCanvas}
-      style="width: {gifDisplayWidth}px; height: {gifDisplayHeight}px; transform: translate({panX}px, {panY}px) scale({zoomLevel}); transform-origin: center;"
-      onpointerdown={onVideoPointerDown}
-      onpointermove={onVideoPointerMove}
-      onpointerup={onVideoPointerUp}
-      onclick={onVideoClick}
-      ondblclick={onVideoDblClick}
-    ></canvas>
   {:else}
     <video
       bind:this={videoEl}
@@ -533,7 +319,11 @@
       bind:paused
       bind:volume
       bind:muted
-      style="transform: translate({panX}px, {panY}px) scale({zoomLevel}); transform-origin: center;"
+      style="
+        transform: rotate({rotation}deg) translate({panX}px, {panY}px) scale({zoomLevel});
+        transform-origin: center;
+        {rotation === 90 || rotation === 270 ? 'width: 100vh; height: 100vw;' : 'width: 100%; height: 100%;'}
+      "
       onpointerdown={onVideoPointerDown}
       onpointermove={onVideoPointerMove}
       onpointerup={onVideoPointerUp}
@@ -582,40 +372,43 @@
       </div>
 
       <div class="right">
-        {#if !isGif}
-          <button
-            class="btn"
-            onclick={() => { if (videoEl) videoEl.muted = !videoEl.muted; }}
-          >
-            {#if muted || volume === 0}
-              <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
-                <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
-              </svg>
-            {:else if volume > 0.5}
-              <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
-                <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
-              </svg>
-            {:else}
-              <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
-                <path d="M18.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM5 9v6h4l5 5V4L9 9H5z"/>
-              </svg>
-            {/if}
-          </button>
-          <input
-            type="range"
-            class="vol"
-            min="0"
-            max="1"
-            step="0.02"
-            value={muted ? 0 : volume}
-            oninput={onVolumeInput}
-          />
-        {/if}
-        {#if isGif}
-          <button class="btn speed-btn" onclick={cycleGifSpeed} title="Velocidad de reproducción">
-            {gifSpeed}×
-          </button>
-        {/if}
+        <button
+          class="btn"
+          onclick={() => { if (videoEl) videoEl.muted = !videoEl.muted; }}
+        >
+          {#if muted || volume === 0}
+            <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+              <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
+            </svg>
+          {:else if volume > 0.5}
+            <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+              <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+            </svg>
+          {:else}
+            <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+              <path d="M18.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM5 9v6h4l5 5V4L9 9H5z"/>
+            </svg>
+          {/if}
+        </button>
+        <input
+          type="range"
+          class="vol"
+          min="0"
+          max="1"
+          step="0.02"
+          value={muted ? 0 : volume}
+          oninput={onVolumeInput}
+        />
+        <button class="btn" onclick={rotateLeft} title="Girar izquierda ([)">
+          <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+            <path d="M7.11 8.53 5.7 7.11C4.8 8.27 4.24 9.61 4.07 11h2.02c.14-.87.49-1.72 1.02-2.47zM6.09 13H4.07c.17 1.39.72 2.73 1.62 3.89l1.41-1.42c-.52-.75-.87-1.59-1.01-2.47zm1.01 5.32c1.16.9 2.51 1.44 3.9 1.61V17.9c-.87-.15-1.71-.49-2.46-1.03L7.1 18.32zM13 4.07V1L8.45 5.55 13 10V6.09c2.84.48 5 2.94 5 5.91s-2.16 5.43-5 5.91v2.02c3.95-.49 7-3.85 7-7.93s-3.05-7.44-7-7.93z"/>
+          </svg>
+        </button>
+        <button class="btn" onclick={rotateRight} title="Girar derecha (])">
+          <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+            <path d="M15.55 5.55 11 1v3.07C7.06 4.56 4 7.92 4 12s3.05 7.44 7 7.93v-2.02c-2.84-.48-5-2.94-5-5.91s2.16-5.43 5-5.91V10l4.55-4.45zM19.93 11c-.17-1.39-.72-2.73-1.62-3.89l-1.42 1.42c.54.75.88 1.6 1.02 2.47h2.02zM13 17.9v2.02c1.39-.17 2.74-.71 3.9-1.61l-1.44-1.44c-.75.54-1.59.89-2.46 1.03zm3.89-2.42 1.42 1.41c.9-1.16 1.45-2.5 1.62-3.89h-2.02c-.14.87-.48 1.72-1.02 2.48z"/>
+          </svg>
+        </button>
         <button
           class="btn"
           class:active={looping}
@@ -677,25 +470,16 @@
   .root.has-video:not(.controls-on):not(.zoomed) {
     cursor: none;
   }
-  .root.zoomed video,
-  .root.zoomed canvas {
+  .root.zoomed video {
     cursor: grab;
   }
-  .root.zoomed.panning video,
-  .root.zoomed.panning canvas {
+  .root.zoomed.panning video {
     cursor: grabbing;
   }
 
   video {
-    width: 100%;
-    height: 100%;
     object-fit: contain;
     display: block;
-  }
-
-  canvas {
-    display: block;
-    background: #000;
   }
 
   /* ── Empty state ─────────────────────────────── */
@@ -846,13 +630,6 @@
 
   .sep {
     opacity: 0.35;
-  }
-
-  .speed-btn {
-    font-family: ui-monospace, monospace;
-    font-size: 11px;
-    min-width: 28px;
-    letter-spacing: -0.02em;
   }
 
   /* Volume slider */
