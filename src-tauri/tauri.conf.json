@@ -27,7 +27,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkwM0NCNEQ2RkY3RUYyQTYKUldTbThuNy8xclE4a0Y4YVIrWlg0VTVNeHVyWVFHNzVmR1h2OUlaZGt0QmlCTzljQnJkSnRqUGUK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY2M0NGOTRFNzYxRTg2RDMKUldUVGhoNTJUdms4WmxFTHc4WWtnYW1BTHp6MW5icTFvUjFjQ1BraGtSTFRKRUNYWUpNWDJaN28K",
       "endpoints": [
         "https://github.com/Franco-im1/vids-player/releases/latest/download/latest.json"
       ]
